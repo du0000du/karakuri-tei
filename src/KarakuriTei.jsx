@@ -2699,31 +2699,39 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     }
   };
 
-  // R3-001: ネイティブ passive:false で touchstart/touchmove/touchend を制御
-  // 緑エリア（配置候補）・ピース・オーバーレイをタッチした touchstart の瞬間に
-  // touchConsumingRef フラグを立て、続く touchmove で「ブラウザのスクロール再開」を防ぐ。
-  // 空白エリアではフラグを立てない → ブラウザのスクロールに委ねる（F11 共存）。
+  // R3-001: ネイティブ passive:false で touchstart/touchmove/touchend/touchcancel を制御
+  //
+  // 抑制対象（touchConsumingRef = true → スクロール抑制）:
+  //   1. ドラッグ中のピース上                 ... draggingPiece が真
+  //   2. 配置済みピース選択中（オーバーレイ） ... selectedPlaced が真
+  //   3. 配置候補の緑エリア上                 ... selectedType + canPlaceAt が真
+  //
+  // 上記以外（何も選択していない空白エリア等）はフラグを立てず、
+  // touch-action: pan-y によるブラウザの縦スクロールに委ねる（F11 共存）。
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const shouldConsumeTouch = (clientX, clientY) => {
       if (isRunning) return false;
-      const pos = getCanvasPos(clientX, clientY);
-      // 1. オーバーレイ（回転/削除アイコン）
-      if (findOverlayHit(pos.x, pos.y)) return true;
-      // 2. 既存ピース上
-      if (findPieceAt(pos.x, pos.y)) return true;
-      // 3. 緑エリア（ピース種別選択中 かつ 配置可能な位置）
+
+      // 1. すでにドラッグが発生しているピースを動かしている最中
+      if (draggingPiece) return true;
+
+      // 2. 配置済みピース選択中（左右回転/削除のオーバーレイUI表示中）
+      if (selectedPlaced) return true;
+
+      // 3. ピース種別選択中 かつ 配置候補の緑エリア上
       if (selectedType) {
+        const pos = getCanvasPos(clientX, clientY);
         const gx = snapToGrid(pos.x);
         const gy = snapToGrid(pos.y);
         if (canPlaceAt(selectedType, gx, gy, placed, stage.fixed, stage.ballStart, stage.goal)) {
           return true;
         }
       }
-      // 4. 配置済みピースが選択中（オーバーレイUI表示中）なら誤タップ防止で抑制
-      if (selectedPlaced) return true;
+
+      // それ以外（未選択 + 空白 / 緑以外）→ スクロール許可
       return false;
     };
 
@@ -2738,9 +2746,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     };
 
     const handleTouchMove = (e) => {
-      // R3-001 fix: touchstart で緑/ピース/オーバーレイを掴んでいたら touchmove も抑制
-      // （これが抜けるとブラウザがスクロールを再開してしまう）
-      if (touchConsumingRef.current && e.cancelable) {
+      // 開始時にフラグを立てた、または途中で長押しドラッグが始まった場合は抑制
+      if ((touchConsumingRef.current || draggingPiece) && e.cancelable) {
         e.preventDefault();
       }
     };
@@ -2763,7 +2770,7 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
       canvas.removeEventListener('touchend', handleTouchEnd);
       canvas.removeEventListener('touchcancel', handleTouchCancel);
     };
-  }, [selectedType, selectedPlaced, placed, stage, isRunning]);
+  }, [selectedType, selectedPlaced, placed, stage, isRunning, draggingPiece]);
 
   const handleRun = () => {
     if (placed.length === 0) return;
@@ -2936,9 +2943,9 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
             }}
             style={{
               width: '100%', height: 'auto', maxWidth: W,
-              // R3-001: touch-action を none に変更し JS 完全制御
-              // 空白エリアでのスクロールはキャンバス外（上下のヘッダー/ツールバー）に委ねる
-              touchAction: 'none',
+              // R3-001: 縦スクロールを許可しつつ、JS 側で「選択中/緑エリア/ドラッグ中」のみ
+              // touchConsumingRef を立てて preventDefault → スクロール抑制
+              touchAction: 'pan-y',
               cursor: draggingPiece ? 'grabbing' : (selectedType ? 'crosshair' : 'pointer'),
               userSelect: 'none',
             }}
