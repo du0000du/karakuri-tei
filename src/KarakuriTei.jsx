@@ -1980,9 +1980,6 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
   const animTRef = useRef(0); // 累積秒数（動的ピースのフェーズに利用）
   // F1: pointerDown 情報（タップ/ドラッグ判別用）
   const pointerDownRef = useRef(null); // { startX, startY, startTime, targetPieceId, dragMode, longPressTimer }
-  // R3-001: 「touchstart で緑/ピース/オーバーレイを掴んでいる」フラグ。
-  // touchmove でブラウザのスクロール再開を防ぐために必要。
-  const touchConsumingRef = useRef(false);
   // R3-010: ダーティフラグ（一時的な再描画要求）
   const dirtyRef = useRef(true);
 
@@ -2699,78 +2696,79 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     }
   };
 
-  // R3-001: ネイティブ passive:false で touchstart/touchmove/touchend/touchcancel を制御
-  //
-  // 抑制対象（touchConsumingRef = true → スクロール抑制）:
-  //   1. ドラッグ中のピース上                 ... draggingPiece が真
-  //   2. 配置済みピース選択中（オーバーレイ） ... selectedPlaced が真
-  //   3. 配置候補の緑エリア上                 ... selectedType + canPlaceAt が真
-  //
-  // 上記以外（何も選択していない空白エリア等）はフラグを立てず、
-  // touch-action: pan-y によるブラウザの縦スクロールに委ねる（F11 共存）。
+  // R3-001: タッチ完全制御
+  // React の onTouch* は React 17+ で passive 登録のため preventDefault が効かない。
+  // useEffect 内で passive:false の native listener を直接登録する。
+  // touch-action: none と組み合わせて JS 完全制御し、空白エリアのスクロールは
+  // window.scrollBy で手動補完することで F11 を共存させる。
+  const _touchHandlersRef = useRef({ down: null, move: null, up: null });
+  _touchHandlersRef.current = {
+    down: handlePointerDown,
+    move: handlePointerMove,
+    up: handlePointerUp,
+  };
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const shouldConsumeTouch = (clientX, clientY) => {
-      if (isRunning) return false;
+    const lastTouchY = { val: 0 };
 
-      // 1. すでにドラッグが発生しているピースを動かしている最中
-      if (draggingPiece) return true;
-
-      // 2. 配置済みピース選択中（左右回転/削除のオーバーレイUI表示中）
-      if (selectedPlaced) return true;
-
-      // 3. ピース種別選択中 かつ 配置候補の緑エリア上
-      if (selectedType) {
-        const pos = getCanvasPos(clientX, clientY);
-        const gx = snapToGrid(pos.x);
-        const gy = snapToGrid(pos.y);
-        if (canPlaceAt(selectedType, gx, gy, placed, stage.fixed, stage.ballStart, stage.goal)) {
-          return true;
-        }
-      }
-
-      // それ以外（未選択 + 空白 / 緑以外）→ スクロール許可
-      return false;
-    };
-
-    const handleTouchStart = (e) => {
+    const onTouchStart = (e) => {
       if (e.touches.length === 0) return;
       const t = e.touches[0];
-      const consume = shouldConsumeTouch(t.clientX, t.clientY);
-      touchConsumingRef.current = consume;
-      if (consume && e.cancelable) {
+      lastTouchY.val = t.clientY;
+      _touchHandlersRef.current.down(t.clientX, t.clientY);
+      // pointerDownRef が非null = ゲーム操作あり → スクロール抑制
+      if (pointerDownRef.current && e.cancelable) {
         e.preventDefault();
       }
     };
 
-    const handleTouchMove = (e) => {
-      // 開始時にフラグを立てた、または途中で長押しドラッグが始まった場合は抑制
-      if ((touchConsumingRef.current || draggingPiece) && e.cancelable) {
-        e.preventDefault();
+    const onTouchMove = (e) => {
+      if (e.touches.length === 0) return;
+      const t = e.touches[0];
+      const deltaY = lastTouchY.val - t.clientY;
+      if (pointerDownRef.current) {
+        // ゲーム操作中 → スクロールをブロックしてゲームに渡す
+        if (e.cancelable) e.preventDefault();
+        _touchHandlersRef.current.move(t.clientX, t.clientY);
+      } else {
+        // 空白エリア → ページを手動スクロール（touch-action:none の補完）
+        window.scrollBy(0, deltaY);
+      }
+      lastTouchY.val = t.clientY;
+    };
+
+    const onTouchEnd = (e) => {
+      if (e.changedTouches.length === 0) return;
+      const t = e.changedTouches[0];
+      if (pointerDownRef.current) {
+        if (e.cancelable) e.preventDefault();
+        _touchHandlersRef.current.up(t.clientX, t.clientY);
       }
     };
 
-    const handleTouchEnd = () => {
-      touchConsumingRef.current = false;
+    const onTouchCancel = (e) => {
+      if (e.changedTouches.length === 0) return;
+      const t = e.changedTouches[0];
+      if (pointerDownRef.current) {
+        _touchHandlersRef.current.up(t.clientX, t.clientY);
+      }
     };
 
-    const handleTouchCancel = () => {
-      touchConsumingRef.current = false;
-    };
+    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+    canvas.addEventListener('touchcancel', onTouchCancel);
 
-    canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
-    canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
-    canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
-    canvas.addEventListener('touchcancel', handleTouchCancel, { passive: false });
     return () => {
-      canvas.removeEventListener('touchstart', handleTouchStart);
-      canvas.removeEventListener('touchmove', handleTouchMove);
-      canvas.removeEventListener('touchend', handleTouchEnd);
-      canvas.removeEventListener('touchcancel', handleTouchCancel);
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
+      canvas.removeEventListener('touchcancel', onTouchCancel);
     };
-  }, [selectedType, selectedPlaced, placed, stage, isRunning, draggingPiece]);
+  }, []); // canvasRef / pointerDownRef / _touchHandlersRef はすべて stable ref
 
   const handleRun = () => {
     if (placed.length === 0) return;
@@ -2904,48 +2902,12 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
             onMouseMove={(e) => handlePointerMove(e.clientX, e.clientY)}
             onMouseUp={(e) => handlePointerUp(e.clientX, e.clientY)}
             onMouseLeave={handlePointerLeave}
-            onTouchStart={(e) => {
-              if (e.touches.length > 0) {
-                const t = e.touches[0];
-                handlePointerDown(t.clientX, t.clientY);
-                // F11: pointerDownRef が立っている = ピース上 → preventDefault
-                if (pointerDownRef.current) {
-                  e.preventDefault();
-                }
-              }
-            }}
-            onTouchMove={(e) => {
-              if (e.touches.length > 0) {
-                const t = e.touches[0];
-                // F11: pointerDownRef があるとき（ピース上で操作中）のみpreventDefault
-                if (pointerDownRef.current) {
-                  handlePointerMove(t.clientX, t.clientY);
-                  e.preventDefault();
-                }
-              }
-            }}
-            onTouchEnd={(e) => {
-              if (e.changedTouches.length > 0) {
-                const t = e.changedTouches[0];
-                if (pointerDownRef.current) {
-                  handlePointerUp(t.clientX, t.clientY);
-                  e.preventDefault();
-                }
-              }
-            }}
-            onTouchCancel={(e) => {
-              if (e.changedTouches.length > 0) {
-                const t = e.changedTouches[0];
-                if (pointerDownRef.current) {
-                  handlePointerUp(t.clientX, t.clientY);
-                }
-              }
-            }}
+            // R3-001: タッチは useEffect 内のネイティブリスナー（passive:false）で処理
             style={{
               width: '100%', height: 'auto', maxWidth: W,
-              // R3-001: 縦スクロールを許可しつつ、JS 側で「選択中/緑エリア/ドラッグ中」のみ
-              // touchConsumingRef を立てて preventDefault → スクロール抑制
-              touchAction: 'pan-y',
+              // R3-001: touch-action:none で JS 完全制御。
+              // 空白エリアのスクロールは window.scrollBy で補完
+              touchAction: 'none',
               cursor: draggingPiece ? 'grabbing' : (selectedType ? 'crosshair' : 'pointer'),
               userSelect: 'none',
             }}
