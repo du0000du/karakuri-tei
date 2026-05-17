@@ -1980,6 +1980,9 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
   const animTRef = useRef(0); // 累積秒数（動的ピースのフェーズに利用）
   // F1: pointerDown 情報（タップ/ドラッグ判別用）
   const pointerDownRef = useRef(null); // { startX, startY, startTime, targetPieceId, dragMode, longPressTimer }
+  // R3-001: 「touchstart で緑/ピース/オーバーレイを掴んでいる」フラグ。
+  // touchmove でブラウザのスクロール再開を防ぐために必要。
+  const touchConsumingRef = useRef(false);
   // R3-010: ダーティフラグ（一時的な再描画要求）
   const dirtyRef = useRef(true);
 
@@ -2696,9 +2699,10 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     }
   };
 
-  // R3-001: ネイティブ passive:false 経由で touchstart/touchmove の preventDefault を有効化
-  // 緑エリア（配置候補）・ピース・オーバーレイをタッチしたときだけスクロール抑制
-  // 空白エリアではブラウザのスクロールに委ねる（F11 共存）
+  // R3-001: ネイティブ passive:false で touchstart/touchmove/touchend を制御
+  // 緑エリア（配置候補）・ピース・オーバーレイをタッチした touchstart の瞬間に
+  // touchConsumingRef フラグを立て、続く touchmove で「ブラウザのスクロール再開」を防ぐ。
+  // 空白エリアではフラグを立てない → ブラウザのスクロールに委ねる（F11 共存）。
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -2718,31 +2722,46 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
           return true;
         }
       }
-      // 4. ピース選択中なら（緑以外でも）誤タップ防止で抑制
+      // 4. 配置済みピースが選択中（オーバーレイUI表示中）なら誤タップ防止で抑制
       if (selectedPlaced) return true;
       return false;
     };
 
-    const onTouchStart = (e) => {
+    const handleTouchStart = (e) => {
       if (e.touches.length === 0) return;
       const t = e.touches[0];
-      if (shouldConsumeTouch(t.clientX, t.clientY)) {
+      const consume = shouldConsumeTouch(t.clientX, t.clientY);
+      touchConsumingRef.current = consume;
+      if (consume && e.cancelable) {
         e.preventDefault();
       }
     };
 
-    const onTouchMove = (e) => {
-      // 操作中（pointerDownRef がある）なら常に preventDefault してスクロールを抑制
-      if (pointerDownRef.current) {
-        if (e.cancelable) e.preventDefault();
+    const handleTouchMove = (e) => {
+      // R3-001 fix: touchstart で緑/ピース/オーバーレイを掴んでいたら touchmove も抑制
+      // （これが抜けるとブラウザがスクロールを再開してしまう）
+      if (touchConsumingRef.current && e.cancelable) {
+        e.preventDefault();
       }
     };
 
-    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
-    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    const handleTouchEnd = () => {
+      touchConsumingRef.current = false;
+    };
+
+    const handleTouchCancel = () => {
+      touchConsumingRef.current = false;
+    };
+
+    canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
+    canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
+    canvas.addEventListener('touchcancel', handleTouchCancel, { passive: false });
     return () => {
-      canvas.removeEventListener('touchstart', onTouchStart);
-      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchstart', handleTouchStart);
+      canvas.removeEventListener('touchmove', handleTouchMove);
+      canvas.removeEventListener('touchend', handleTouchEnd);
+      canvas.removeEventListener('touchcancel', handleTouchCancel);
     };
   }, [selectedType, selectedPlaced, placed, stage, isRunning]);
 
