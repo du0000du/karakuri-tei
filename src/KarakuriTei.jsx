@@ -124,7 +124,8 @@ const PIECE_DEFS = {
     width: 1.0, height: 1.0,
     rotations: [0],
     flippable: false,
-    shapes: ['round', 'triangle_up', 'triangle_left', 'triangle_right'],
+    // R4-001: 左矢印で左向き三角・右矢印で右向き三角となる直観的サイクル順
+    shapes: ['round', 'triangle_left', 'triangle_up', 'triangle_right'],
     restitution: 0.4,
     friction: 0.05,
   },
@@ -779,6 +780,10 @@ function simStep(state, t) {
         hit = circleVsSegment(ball.x, ball.y, BALL_R, seg.x1, seg.y1, seg.x2, seg.y2);
       }
       if (hit.hit) {
+        // R4-005: 衝突強度（速度の法線成分）から音量を決定
+        const vdotn = ball.vx * hit.nx + ball.vy * hit.ny;
+        const intensity = Math.min(1, Math.abs(vdotn) / 300);
+        if (intensity > 0.15) audio.hit(intensity);
         resolve(ball, hit.nx, hit.ny, hit.depth, seg.restitution, seg.friction);
 
         // === 反転扉 ===
@@ -923,8 +928,23 @@ class AudioEngine {
   place() { this.tone(220, 0.08, 0.08, 'triangle'); }
   pickup() { this.tone(330, 0.06, 0.06, 'triangle'); }
   remove() { this.tone(180, 0.1, 0.07, 'sawtooth', 0.005, 0.1); }
+  // R4-005: hit を強度反映・短時間クールダウン付きに
   hit(intensity = 1) {
-    this.tone(80 + Math.random()*40, 0.05, 0.04 * intensity, 'triangle');
+    if (!this.enabled) return;
+    const now = performance.now();
+    if (this._lastHit && now - this._lastHit < 30) return;
+    this._lastHit = now;
+    const vol = 0.04 * Math.max(0.1, Math.min(1, intensity));
+    this.tone(80 + Math.random()*40, 0.05, vol, 'triangle');
+  }
+  // R4-005: ボール転がり音（連続呼び出し前提・速度で音量と周波数を変化）
+  rolling(speed) {
+    if (!this.enabled) return;
+    const s = Math.max(0, speed);
+    const freq = 80 + Math.min(s * 0.1, 200);
+    const vol = 0.03 * Math.min(1, s / 200);
+    if (vol < 0.005) return;
+    this.tone(freq, 0.06, vol, 'sawtooth');
   }
   spring() { this.tone(550, 0.12, 0.1, 'square', 0.005, 0.12); }
   bell() {
@@ -1590,6 +1610,27 @@ function App() {
   // R3-006: シーン遷移用 visible state
   const [sceneVisible, setSceneVisible] = useState(true);
 
+  // R4-003: サウンド ON/OFF（localStorage 永続化）
+  const [audioEnabled, setAudioEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('karakuri:audio') !== '0';
+    } catch (e) {
+      return true;
+    }
+  });
+  // 初回マウント時に audio singleton に反映
+  useEffect(() => {
+    audio.enabled = audioEnabled;
+  }, [audioEnabled]);
+  const toggleAudio = useCallback(() => {
+    setAudioEnabled(prev => {
+      const next = !prev;
+      audio.enabled = next;
+      try { localStorage.setItem('karakuri:audio', next ? '1' : '0'); } catch (e) {}
+      return next;
+    });
+  }, []);
+
   // R3-006: scene が変化したら一度フェードアウト → フェードイン
   useEffect(() => {
     if (scene === prevScene) return;
@@ -1679,7 +1720,8 @@ function App() {
         .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(232,223,201,0.3); border-radius: 2px; }
       `}</style>
 
-      <div className="w-full max-w-md min-h-screen relative" style={{ background: PALETTE.sand }}>
+      {/* R4-002: 768px 以上では幅制限を解除、ゲーム本体は内部で md:flex で横並びに */}
+      <div className="w-full max-w-md md:max-w-3xl min-h-screen relative" style={{ background: PALETTE.sand }}>
         {/* R3-006: シーン遷移フェード */}
         <div
           style={{
@@ -1713,6 +1755,8 @@ function App() {
             progress={progress}
             hintUsed={!!progress.hintsUsed[currentStageId]}
             saveStatus={saveStatus}
+            audioEnabled={audioEnabled}
+            onToggleAudio={toggleAudio}
             onComplete={(piecesUsed, hintUsed) => {
               return updateStageResult(currentStageId, piecesUsed, hintUsed);
             }}
@@ -1748,7 +1792,8 @@ function App() {
 // ============================================================================
 function TitleScreen({ onStart, onAbout, clearedCount, totalStages }) {
   return (
-    <div className="min-h-screen flex flex-col items-center justify-between px-6 py-12 fade-in" style={{ background: PALETTE.sand }}>
+    // R4-002: md+ ではコンテンツを max-w-sm に制約して横間延びを防ぐ
+    <div className="min-h-screen flex flex-col items-center justify-between px-6 py-12 fade-in md:max-w-sm md:mx-auto" style={{ background: PALETTE.sand }}>
       <div className="flex-1 flex flex-col items-center justify-center">
         <div className="text-center mb-2">
           <div className="font-noto-serif text-xs tracking-[0.4em]" style={{ color: PALETTE.inkSoft }}>
@@ -1804,9 +1849,24 @@ function SelectScreen({ stages, progress, onSelect, onBack, onMenu, goldCount, c
   // F7: 次にプレイすべき庭（最も若い未クリアID）
   const nextStage = stages.find(s => !(progress.stages[s.id] && progress.stages[s.id].cleared));
   const allCleared = !nextStage;
+  // R4-006: ステージフィルター ('all' | 'uncleared' | 'gold_missing')
+  const [filter, setFilter] = useState('all');
+  const matchesFilter = (s) => {
+    const p = progress.stages[s.id];
+    if (filter === 'uncleared') return !(p && p.cleared);
+    if (filter === 'gold_missing') {
+      const cleared = p && p.cleared;
+      if (!cleared) return true;
+      const hintUsed = !!progress.hintsUsed[s.id];
+      const isGold = p.bestPieces != null && p.bestPieces <= s.targets.gold && !hintUsed;
+      return !isGold;
+    }
+    return true;
+  };
 
   return (
-    <div className="min-h-screen flex flex-col fade-in" style={{ background: PALETTE.sand }}>
+    // R4-002: md+ ではコンテンツを max-w-sm に制約して横間延びを防ぐ
+    <div className="min-h-screen flex flex-col fade-in md:max-w-sm md:mx-auto md:w-full" style={{ background: PALETTE.sand }}>
       <div className="px-5 pt-6 pb-4 flex items-center justify-between">
         <button onClick={onBack} className="font-noto-serif text-sm" style={{ color: PALETTE.inkSoft }}>
           ← 戻る
@@ -1830,8 +1890,8 @@ function SelectScreen({ stages, progress, onSelect, onBack, onMenu, goldCount, c
         </div>
       </div>
 
-      {/* F7: 続きからセクション */}
-      {nextStage && (
+      {/* F7: 続きからセクション（R4-006: フィルター 'all' のときのみ表示） */}
+      {nextStage && filter === 'all' && (
         <div className="px-5 pb-2">
           <button
             onClick={() => onSelect(nextStage.id)}
@@ -1871,9 +1931,52 @@ function SelectScreen({ stages, progress, onSelect, onBack, onMenu, goldCount, c
         </div>
       )}
 
+      {/* R4-006: フィルタータブ */}
+      <div className="px-5 pb-2 flex gap-1.5">
+        {[
+          { key: 'all', label: '全て' },
+          { key: 'uncleared', label: '未クリア' },
+          { key: 'gold_missing', label: '金賞未取得' },
+        ].map(opt => {
+          const isActive = filter === opt.key;
+          return (
+            <button
+              key={opt.key}
+              onClick={() => setFilter(opt.key)}
+              className="flex-1 py-1.5 font-noto-serif text-[11px] tracking-wider border"
+              style={{
+                background: isActive ? PALETTE.ink : 'transparent',
+                color: isActive ? PALETTE.sandPale : PALETTE.inkSoft,
+                borderColor: isActive ? PALETTE.ink : PALETTE.inkSoft + '40',
+              }}
+              aria-pressed={isActive}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+
       <div className="flex-1 overflow-y-auto px-5 py-4 scrollbar-thin">
+        {(() => {
+          // R4-006: 全ティアでフィルタ後 0 件の場合は空状態 UI を表示
+          const totalAfterFilter = stages.filter(matchesFilter).length;
+          if (totalAfterFilter === 0) {
+            return (
+              <div className="text-center py-12">
+                <div className="font-noto-serif text-sm" style={{ color: PALETTE.inkSoft }}>
+                  {filter === 'uncleared' && '未クリアの庭はありません'}
+                  {filter === 'gold_missing' && '全て金賞を達成しました'}
+                </div>
+              </div>
+            );
+          }
+          return null;
+        })()}
         {['tutorial', 'beginner', 'intermediate'].map(tier => {
-          const tierStages = stages.filter(s => s.tier === tier);
+          // R4-006: フィルタ適用後 0 件のティアセクションは非表示
+          const tierStages = stages.filter(s => s.tier === tier && matchesFilter(s));
+          if (tierStages.length === 0) return null;
           return (
             <div key={tier} className="mb-6">
               <div className="flex items-center gap-3 mb-3">
@@ -1953,7 +2056,7 @@ function SelectScreen({ stages, progress, onSelect, onBack, onMenu, goldCount, c
 // ============================================================================
 // プレイ画面
 // ============================================================================
-function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, onComplete, onBack, onNext }) {
+function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, audioEnabled, onToggleAudio, onComplete, onBack, onNext }) {
   const canvasRef = useRef(null);
   const [placed, setPlaced] = useState([]); // 配置済みピース
   const [selectedType, setSelectedType] = useState(null);
@@ -1982,6 +2085,21 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
   const pointerDownRef = useRef(null); // { startX, startY, startTime, targetPieceId, dragMode, longPressTimer }
   // R3-010: ダーティフラグ（一時的な再描画要求）
   const dirtyRef = useRef(true);
+  // R4-004: アンドゥ用ヒストリ（最大 10 手）
+  const MAX_HISTORY = 10;
+  const placedHistoryRef = useRef([]);
+  const [historyDepth, setHistoryDepth] = useState(0);
+  const pushPlacedHistory = useCallback((snapshot) => {
+    placedHistoryRef.current = [
+      ...placedHistoryRef.current.slice(-MAX_HISTORY + 1),
+      snapshot,
+    ];
+    setHistoryDepth(placedHistoryRef.current.length);
+  }, []);
+  const clearPlacedHistory = useCallback(() => {
+    placedHistoryRef.current = [];
+    setHistoryDepth(0);
+  }, []);
 
   // 残りピース計算
   const pieceCounts = {};
@@ -2011,6 +2129,9 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     setDraggingPiece(null);
     setTrail([]);
     pointerDownRef.current = null;
+    // R4-004: アンドゥ履歴もクリア
+    placedHistoryRef.current = [];
+    setHistoryDepth(0);
     const bsx = (stage.ballStart.col + 0.5) * CELL;
     const bsy = (stage.ballStart.row + 0.5) * CELL;
     setBall({ x: bsx, y: bsy, vx: 0, vy: 0, alive: false });
@@ -2139,7 +2260,9 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
       const def = PIECE_DEFS[p.type];
       const baseR = Math.max(def.width, def.height) * CELL * 0.5;
       const overlayR = Math.max(baseR + 16, CELL * 1.1);
-      const canRotate = def.rotations.length > 1 || def.shapes;
+      // R4-001: 回転(角度) と 形状変更(shapes) を分離
+      const canRotate = def.rotations.length > 1;
+      const canChangeShape = !!def.shapes && def.shapes.length > 1;
 
       // ピース上部の × アイコン
       const removeX = p.x;
@@ -2231,6 +2354,67 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
         ctx.arc(p.x, p.y, overlayR, 0, Math.PI*2);
         ctx.stroke();
         ctx.globalAlpha = 1;
+      } else if (canChangeShape) {
+        // R4-001: 形状変更 UI（◇ + 左右矢印 + 形状名）
+        // 左半円: ◇ ←
+        ctx.save();
+        ctx.fillStyle = PALETTE.ink;
+        ctx.globalAlpha = 0.55;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, overlayR, Math.PI/2, Math.PI*3/2);
+        ctx.closePath();
+        ctx.fill();
+        // 左矢印（◇ + ←）
+        ctx.strokeStyle = PALETTE.sandPale;
+        ctx.globalAlpha = 0.95;
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+        const lcx = p.x - overlayR * 0.55;
+        const lcy = p.y;
+        // 矢印 ←
+        ctx.beginPath();
+        ctx.moveTo(lcx + 6, lcy);
+        ctx.lineTo(lcx - 6, lcy);
+        ctx.moveTo(lcx - 6, lcy);
+        ctx.lineTo(lcx - 2, lcy - 4);
+        ctx.moveTo(lcx - 6, lcy);
+        ctx.lineTo(lcx - 2, lcy + 4);
+        ctx.stroke();
+        ctx.restore();
+
+        // 右半円: → ◇
+        ctx.save();
+        ctx.fillStyle = PALETTE.ink;
+        ctx.globalAlpha = 0.55;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, overlayR, -Math.PI/2, Math.PI/2);
+        ctx.closePath();
+        ctx.fill();
+        // 右矢印（→）
+        ctx.strokeStyle = PALETTE.sandPale;
+        ctx.globalAlpha = 0.95;
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+        const rcx = p.x + overlayR * 0.55;
+        const rcy = p.y;
+        ctx.beginPath();
+        ctx.moveTo(rcx - 6, rcy);
+        ctx.lineTo(rcx + 6, rcy);
+        ctx.moveTo(rcx + 6, rcy);
+        ctx.lineTo(rcx + 2, rcy - 4);
+        ctx.moveTo(rcx + 6, rcy);
+        ctx.lineTo(rcx + 2, rcy + 4);
+        ctx.stroke();
+        ctx.restore();
+
+        // ピースの輪郭ハイライト
+        ctx.strokeStyle = PALETTE.moss;
+        ctx.globalAlpha = 0.7;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, overlayR, 0, Math.PI*2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
       } else {
         // 回転不可ピースは輪のみ
         ctx.strokeStyle = PALETTE.moss;
@@ -2296,6 +2480,9 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     }
   }, [placed, ball, frame, pointer, selectedType, selectedPlaced, isRunning, hintData, stage, trail, result, ghostRotation, ghostShape, draggingPiece]);
 
+  // R4-005: 転がり音用フレームカウンタ
+  const rollingFrameRef = useRef(0);
+
   // アニメーションループ
   useEffect(() => {
     let lastT = performance.now();
@@ -2317,6 +2504,13 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
       if (isRunning) {
         const state = stateRef.current;
         simStep(state, animTRef.current);
+
+        // R4-005: ボール転がり音（8フレームごと、生きていて十分な速度のとき）
+        rollingFrameRef.current = (rollingFrameRef.current + 1) & 0xFFFF;
+        if (state.ball.alive && (rollingFrameRef.current % 8) === 0) {
+          const speed = Math.sqrt(state.ball.vx * state.ball.vx + state.ball.vy * state.ball.vy);
+          if (speed > 60) audio.rolling(speed);
+        }
 
         // 同期
         setBall({ ...state.ball });
@@ -2436,6 +2630,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     if (!selectedPlaced) return;
     const def = PIECE_DEFS[selectedPlaced.type];
     if (def.rotations.length <= 1 && !def.shapes) return;
+    // R4-004: 現在の placed を履歴に push
+    pushPlacedHistory(placed);
     setPlaced(prev => prev.map(p => {
       if (p.id !== selectedPlaced.id) return p;
       if (def.rotations.length > 1) {
@@ -2472,6 +2668,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
 
   const removeSelectedPlaced = () => {
     if (!selectedPlaced) return;
+    // R4-004: 現在の placed を履歴に push
+    pushPlacedHistory(placed);
     setPlaced(prev => prev.filter(p => p.id !== selectedPlaced.id));
     setSelectedPlaced(null);
     audio.remove();
@@ -2631,6 +2829,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
           dragged.id
         );
         if (valid) {
+          // R4-004: ドラッグ完了時に履歴 push
+          pushPlacedHistory(placed);
           setPlaced(prev => prev.map(p => p.id === dragged.id ? { ...p, x: newX, y: newY } : p));
           audio.place();
         } else {
@@ -2672,6 +2872,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
             rotation: ghostRotation,
             shape: ghostShape || (def.shapes ? def.shapes[0] : undefined),
           };
+          // R4-004: 新規配置時に履歴 push
+          pushPlacedHistory(placed);
           setPlaced(prev => [...prev, newP]);
           setSelectedPlaced(newP);
           audio.place();
@@ -2826,6 +3028,20 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
     handleStop();
     setResult(null);
     setShowResetConfirm(false);
+    // R4-004: 整える時はアンドゥ履歴もクリア
+    clearPlacedHistory();
+  };
+
+  // R4-004: 一手戻す
+  const handleUndo = () => {
+    if (isRunning || placedHistoryRef.current.length === 0) return;
+    const prev = placedHistoryRef.current[placedHistoryRef.current.length - 1];
+    placedHistoryRef.current = placedHistoryRef.current.slice(0, -1);
+    setHistoryDepth(placedHistoryRef.current.length);
+    setPlaced(prev);
+    setSelectedPlaced(null);
+    audio.pickup();
+    dirtyRef.current = true;
   };
 
   // F18: ピースが2個以上なら確認、1個以下なら即時
@@ -2880,6 +3096,12 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
         </button>
       </div>
 
+      {/* R4-002: md+ ではキャンバス左 / サイドパネル右の横並びレイアウト */}
+      <div className="md:flex md:flex-row md:items-start md:gap-6 md:px-4 md:pt-2 md:w-full md:max-w-3xl md:mx-auto">
+
+      {/* === キャンバス + 目標（md+ では左カラム固定幅） === */}
+      <div className="md:flex-shrink-0 flex flex-col">
+
       {/* 目標 */}
       <div className="px-4 py-2 flex items-center justify-center gap-3 text-[11px] font-noto-serif" style={{ color: PALETTE.inkSoft }}>
         <span>金 {stage.targets.gold}</span>
@@ -2915,6 +3137,21 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
         </div>
       </div>
 
+      </div>{/* /キャンバス + 目標 */}
+
+      {/* === サイドパネル（md+ では右カラム） === */}
+      <div className="flex flex-col md:flex-1 md:min-w-[240px]">
+
+      {/* R4-002: md+ でステージ説明をサイドパネルに表示 */}
+      <div className="hidden md:block px-1 pt-1 pb-3">
+        <div className="font-noto-serif text-xs leading-relaxed" style={{ color: PALETTE.inkSoft }}>
+          {stage.instruction}
+        </div>
+        <div className="font-noto-serif text-[10px] mt-3 leading-relaxed" style={{ color: PALETTE.inkSoft, opacity: 0.8 }}>
+          ピースを選んで配置 / 配置済みをタップで回転・削除 / 長押しで移動
+        </div>
+      </div>
+
       {/* F10: 選択中ピースの名前のみ表示（操作はキャンバス上のオーバーレイで完結） */}
       {selectedPlaced && !isRunning && (
         <div className="px-4 py-1 flex items-center justify-center fade-in">
@@ -2927,14 +3164,16 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
       {/* F2: ピース選択中の配置前回転ボタン */}
       {selectedType && !isRunning && !draggingPiece && (() => {
         const def = PIECE_DEFS[selectedType];
-        const canRotate = def.rotations.length > 1 || def.shapes;
-        if (!canRotate) return null;
+        // R4-001: 回転(角度) と 形状変更(shapes) を分離
+        const canRotate = def.rotations.length > 1;
+        const canChangeShape = !!def.shapes && def.shapes.length > 1;
+        if (!canRotate && !canChangeShape) return null;
         const handleGhostRotate = () => {
-          if (def.rotations.length > 1) {
+          if (canRotate) {
             const idx = def.rotations.indexOf(ghostRotation);
             const next = def.rotations[(idx + 1) % def.rotations.length];
             setGhostRotation(next);
-          } else if (def.shapes) {
+          } else if (canChangeShape) {
             const cur = ghostShape || def.shapes[0];
             const idx = def.shapes.indexOf(cur);
             const next = def.shapes[(idx + 1) % def.shapes.length];
@@ -2952,7 +3191,7 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
               className="font-noto-serif text-xs px-3 py-1 border"
               style={{ color: PALETTE.ink, borderColor: PALETTE.inkSoft + '60' }}
             >
-              ↺ 回す
+              {canRotate ? '↺ 回す' : '◇ 形を変える'}
             </button>
             <button
               onClick={() => setSelectedType(null)}
@@ -3006,7 +3245,7 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
       )}
 
       {/* アクションバー（F18: 整えるは右端の小アイコン） */}
-      <div className="px-4 py-3 flex items-center justify-center gap-3 sticky bottom-0" style={{ borderTop: `1px solid ${PALETTE.inkSoft}20`, background: PALETTE.sand }}>
+      <div className="px-4 py-3 flex items-center justify-center gap-3 sticky bottom-0 md:static" style={{ borderTop: `1px solid ${PALETTE.inkSoft}20`, background: PALETTE.sand }}>
         {!isRunning ? (
           <button
             onClick={handleRun}
@@ -3034,6 +3273,22 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
             止める
           </button>
         )}
+        {/* R4-004: 一手戻す */}
+        <button
+          onClick={handleUndo}
+          disabled={isRunning || historyDepth === 0}
+          aria-label="一手戻す"
+          title="一手戻す"
+          className="w-11 h-11 flex items-center justify-center font-noto-serif text-lg border"
+          style={{
+            color: PALETTE.inkSoft,
+            borderColor: PALETTE.inkSoft + '40',
+            opacity: (isRunning || historyDepth === 0) ? 0.4 : 1,
+            borderRadius: '999px',
+          }}
+        >
+          ↩
+        </button>
         <button
           onClick={handleResetRequest}
           disabled={isRunning || placed.length === 0}
@@ -3049,7 +3304,28 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
         >
           ↻
         </button>
+        {/* R4-003: サウンド ON/OFF トグル */}
+        {onToggleAudio && (
+          <button
+            onClick={onToggleAudio}
+            aria-label={audioEnabled ? 'サウンドをオフにする' : 'サウンドをオンにする'}
+            aria-pressed={audioEnabled}
+            title={audioEnabled ? '音 ON' : '音 OFF'}
+            className="w-11 h-11 flex items-center justify-center font-noto-serif text-base border"
+            style={{
+              color: audioEnabled ? PALETTE.ink : PALETTE.inkSoft,
+              borderColor: PALETTE.inkSoft + '40',
+              opacity: audioEnabled ? 1 : 0.5,
+              borderRadius: '999px',
+            }}
+          >
+            {audioEnabled ? '♪' : '♪̸'}
+          </button>
+        )}
       </div>
+
+      </div>{/* /サイドパネル */}
+      </div>{/* /R4-002 横並びラッパー */}
 
       {/* F18: 整える確認ダイアログ */}
       {showResetConfirm && (
@@ -3063,6 +3339,7 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
           stage={stage}
           hintUsed={hintUsed}
           saveStatus={saveStatus}
+          canvasRef={canvasRef}
           onRetry={() => {
             setResult(null);
             const bsx = (stage.ballStart.col + 0.5) * CELL;
@@ -3074,6 +3351,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, on
             setResult(null);
             setPlaced([]);
             setSelectedType(null);
+            // R4-004: 配置を変える時はアンドゥ履歴もクリア
+            clearPlacedHistory();
             const bsx = (stage.ballStart.col + 0.5) * CELL;
             const bsy = (stage.ballStart.row + 0.5) * CELL;
             setBall({ x: bsx, y: bsy, vx: 0, vy: 0, alive: false });
@@ -3159,9 +3438,44 @@ function PiecePreview({ type, size = 32 }) {
 }
 
 // 結果モーダル
-function ResultModal({ result, stage, hintUsed, saveStatus, onRetry, onChange, onNext, onSelect }) {
+function ResultModal({ result, stage, hintUsed, saveStatus, canvasRef, onRetry, onChange, onNext, onSelect }) {
   const dialogRef = useRef(null);
   useFocusTrap(dialogRef, true);
+  // R4-007: 共有機能
+  const [shareStatus, setShareStatus] = useState('idle'); // idle | copied | failed
+  const handleShare = useCallback(async () => {
+    const canvas = canvasRef?.current;
+    const rankLabel = result.rank ? RANK_LABEL[hintUsed && result.rank === 'gold' ? 'silver' : result.rank] : '';
+    const text = `「${stage.name}」を${rankLabel}でクリア！ ${result.piecesUsed}手 #カラクリ庭`;
+    try {
+      let file = null;
+      if (canvas) {
+        const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+        if (blob) file = new File([blob], 'karakuri.png', { type: 'image/png' });
+      }
+      if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'カラクリ庭', text });
+        setShareStatus('idle');
+      } else if (navigator.share) {
+        await navigator.share({ title: 'カラクリ庭', text });
+        setShareStatus('idle');
+      } else if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        setShareStatus('copied');
+        setTimeout(() => setShareStatus('idle'), 2000);
+      } else {
+        setShareStatus('failed');
+        setTimeout(() => setShareStatus('idle'), 2000);
+      }
+    } catch (e) {
+      // ユーザーキャンセルは無視（AbortError）
+      if (e && e.name !== 'AbortError') {
+        console.warn('[karakuri] share failed:', e);
+        setShareStatus('failed');
+        setTimeout(() => setShareStatus('idle'), 2000);
+      }
+    }
+  }, [canvasRef, stage, result, hintUsed]);
 
   if (result.failed) {
     // F3: 失敗種別ごとのメッセージ
@@ -3280,6 +3594,14 @@ function ResultModal({ result, stage, hintUsed, saveStatus, onRetry, onChange, o
               style={{ color: PALETTE.ink, borderColor: PALETTE.inkSoft + '60' }}
             >
               この庭を再挑戦
+            </button>
+            {/* R4-007: 共有ボタン（クリア時のみ） */}
+            <button
+              onClick={handleShare}
+              className="w-full py-2 font-noto-serif text-xs border"
+              style={{ color: PALETTE.moss, borderColor: PALETTE.moss + '60' }}
+            >
+              {shareStatus === 'copied' ? '✓ コピーしました' : shareStatus === 'failed' ? '共有できませんでした' : '📤 共有する'}
             </button>
             <button
               onClick={onSelect}
