@@ -5,3 +5,23 @@
 * {
   box-sizing: border-box;
 }
+
+/* R3-005: モバイルセーフエリア対応 */
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  /* iPhone のノッチ / ホームインジケーター / Android ジェスチャー領域を回避 */
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  background: #2B2A28;
+}
+
+/* R3-006: シーン遷移用のベース */
+.scene-fade {
+  transition: opacity 250ms ease;
+}

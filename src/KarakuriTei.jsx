@@ -967,15 +967,16 @@ async function loadProgress() {
         return JSON.parse(res.value);
       }
     }
-  } catch(e) {}
+  } catch(e) {
+    console.warn('[karakuri] loadProgress failed:', e);
+  }
   return { stages: {}, hintsUsed: {}, version: 1 };
 }
+// R3-003: 失敗時は例外を再スロー（呼び出し元で UI 通知）
 async function saveProgress(p) {
-  try {
-    if (window.storage && window.storage.set) {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(p));
-    }
-  } catch(e) {}
+  if (window.storage && window.storage.set) {
+    await window.storage.set(STORAGE_KEY, JSON.stringify(p));
+  }
 }
 
 // ============================================================================
@@ -1536,16 +1537,69 @@ const RANK_COLOR = {
 };
 
 // ============================================================================
+// R3-009: モーダル用フォーカストラップフック
+// ============================================================================
+function useFocusTrap(ref, active) {
+  useEffect(() => {
+    if (!active) return;
+    const root = ref.current;
+    if (!root) return;
+    const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+    const getFocusables = () => Array.from(root.querySelectorAll(FOCUSABLE)).filter(el => !el.disabled);
+    // 初期フォーカスは最初の要素
+    const first = getFocusables()[0];
+    const prevActive = document.activeElement;
+    first?.focus();
+    const onKey = (e) => {
+      if (e.key !== 'Tab') return;
+      const focusables = getFocusables();
+      if (focusables.length === 0) return;
+      const f = focusables[0];
+      const l = focusables[focusables.length - 1];
+      if (e.shiftKey && document.activeElement === f) {
+        e.preventDefault();
+        l.focus();
+      } else if (!e.shiftKey && document.activeElement === l) {
+        e.preventDefault();
+        f.focus();
+      }
+    };
+    root.addEventListener('keydown', onKey);
+    return () => {
+      root.removeEventListener('keydown', onKey);
+      if (prevActive && prevActive.focus) prevActive.focus();
+    };
+  }, [ref, active]);
+}
+
+// ============================================================================
 // メインコンポーネント
 // ============================================================================
 
 function App() {
   const [scene, setScene] = useState('title'); // title | select | play | result
+  const [prevScene, setPrevScene] = useState('title');
   const [progress, setProgress] = useState({ stages: {}, hintsUsed: {}, version: 1 });
   const [progressLoaded, setProgressLoaded] = useState(false);
   const [currentStageId, setCurrentStageId] = useState(1);
   const [showMenu, setShowMenu] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  // R3-007: 保存状態 idle | saving | saved | failed
+  const [saveStatus, setSaveStatus] = useState('idle');
+  const saveSeqRef = useRef(0);
+  // R3-006: シーン遷移用 visible state
+  const [sceneVisible, setSceneVisible] = useState(true);
+
+  // R3-006: scene が変化したら一度フェードアウト → フェードイン
+  useEffect(() => {
+    if (scene === prevScene) return;
+    setSceneVisible(false);
+    const id = setTimeout(() => {
+      setPrevScene(scene);
+      setSceneVisible(true);
+    }, 150);
+    return () => clearTimeout(id);
+  }, [scene, prevScene]);
 
   // 永続化のロード
   useEffect(() => {
@@ -1555,9 +1609,19 @@ function App() {
     });
   }, []);
 
-  // 永続化のセーブ
+  // R3-003 / R3-007: 永続化のセーブ（状態を追跡）
   useEffect(() => {
-    if (progressLoaded) saveProgress(progress);
+    if (!progressLoaded) return;
+    const seq = ++saveSeqRef.current;
+    setSaveStatus('saving');
+    saveProgress(progress)
+      .then(() => {
+        if (saveSeqRef.current === seq) setSaveStatus('saved');
+      })
+      .catch((err) => {
+        console.warn('[karakuri] saveProgress failed:', err);
+        if (saveSeqRef.current === seq) setSaveStatus('failed');
+      });
   }, [progress, progressLoaded]);
 
   const updateStageResult = useCallback((stageId, piecesUsed, hintUsed) => {
@@ -1616,7 +1680,15 @@ function App() {
       `}</style>
 
       <div className="w-full max-w-md min-h-screen relative" style={{ background: PALETTE.sand }}>
-        {scene === 'title' && (
+        {/* R3-006: シーン遷移フェード */}
+        <div
+          style={{
+            opacity: sceneVisible ? 1 : 0,
+            transition: 'opacity 250ms ease',
+            minHeight: '100vh',
+          }}
+        >
+        {prevScene === 'title' && (
           <TitleScreen
             onStart={() => setScene('select')}
             onAbout={() => setShowAbout(true)}
@@ -1624,7 +1696,7 @@ function App() {
             totalStages={totalStages}
           />
         )}
-        {scene === 'select' && (
+        {prevScene === 'select' && (
           <SelectScreen
             stages={STAGES}
             progress={progress}
@@ -1635,11 +1707,12 @@ function App() {
             clearedCount={clearedCount}
           />
         )}
-        {scene === 'play' && (
+        {prevScene === 'play' && (
           <PlayScreen
             stage={STAGES.find(s => s.id === currentStageId)}
             progress={progress}
             hintUsed={!!progress.hintsUsed[currentStageId]}
+            saveStatus={saveStatus}
             onComplete={(piecesUsed, hintUsed) => {
               return updateStageResult(currentStageId, piecesUsed, hintUsed);
             }}
@@ -1654,6 +1727,7 @@ function App() {
             }}
           />
         )}
+        </div>
         {showMenu && (
           <MenuModal
             onClose={() => setShowMenu(false)}
@@ -1879,7 +1953,7 @@ function SelectScreen({ stages, progress, onSelect, onBack, onMenu, goldCount, c
 // ============================================================================
 // プレイ画面
 // ============================================================================
-function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, onBack, onNext }) {
+function PlayScreen({ stage, progress, hintUsed: initialHintUsed, saveStatus, onComplete, onBack, onNext }) {
   const canvasRef = useRef(null);
   const [placed, setPlaced] = useState([]); // 配置済みピース
   const [selectedType, setSelectedType] = useState(null);
@@ -1906,6 +1980,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
   const animTRef = useRef(0); // 累積秒数（動的ピースのフェーズに利用）
   // F1: pointerDown 情報（タップ/ドラッグ判別用）
   const pointerDownRef = useRef(null); // { startX, startY, startTime, targetPieceId, dragMode, longPressTimer }
+  // R3-010: ダーティフラグ（一時的な再描画要求）
+  const dirtyRef = useRef(true);
 
   // 残りピース計算
   const pieceCounts = {};
@@ -2227,7 +2303,16 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
       const dt = Math.min(50, now - lastT); // ms, クランプ
       lastT = now;
       animTRef.current += dt / 1000;
-      setFrame(f => (f + 1) & 0xFFFF); // 描画トリガ
+
+      // R3-010: 動画的な再描画が必要な条件を判定（シミュレーション停止中のアイドル化）
+      const hasDynamic = placed.some(p => PIECE_DEFS[p.type]?.dynamic);
+      const ripple = stateRef.current.clearTime && (performance.now() - stateRef.current.clearTime < 1200);
+      const gateFx = stateRef.current.gateFlipEffects && stateRef.current.gateFlipEffects.length > 0;
+      const needsTick = isRunning || hasDynamic || ripple || gateFx || dirtyRef.current;
+      if (needsTick) {
+        setFrame(f => (f + 1) & 0xFFFF); // 描画トリガ
+        dirtyRef.current = false;
+      }
 
       if (isRunning) {
         const state = stateRef.current;
@@ -2283,7 +2368,13 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
     animRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animRef.current);
   // eslint-disable-next-line
-  }, [isRunning, totalUsed, stage, hintUsed]);
+  }, [isRunning, totalUsed, stage, hintUsed, placed]);
+
+  // R3-010: 状態変化時にダーティ化（再描画を一回保証）
+  useEffect(() => { dirtyRef.current = true; }, [
+    placed, selectedType, selectedPlaced, draggingPiece,
+    pointer, hintData, result, ghostRotation, ghostShape,
+  ]);
 
   // === F1: ポインタイベント（タップ/長押し/ドラッグの判別） ===
 
@@ -2605,6 +2696,56 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
     }
   };
 
+  // R3-001: ネイティブ passive:false 経由で touchstart/touchmove の preventDefault を有効化
+  // 緑エリア（配置候補）・ピース・オーバーレイをタッチしたときだけスクロール抑制
+  // 空白エリアではブラウザのスクロールに委ねる（F11 共存）
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const shouldConsumeTouch = (clientX, clientY) => {
+      if (isRunning) return false;
+      const pos = getCanvasPos(clientX, clientY);
+      // 1. オーバーレイ（回転/削除アイコン）
+      if (findOverlayHit(pos.x, pos.y)) return true;
+      // 2. 既存ピース上
+      if (findPieceAt(pos.x, pos.y)) return true;
+      // 3. 緑エリア（ピース種別選択中 かつ 配置可能な位置）
+      if (selectedType) {
+        const gx = snapToGrid(pos.x);
+        const gy = snapToGrid(pos.y);
+        if (canPlaceAt(selectedType, gx, gy, placed, stage.fixed, stage.ballStart, stage.goal)) {
+          return true;
+        }
+      }
+      // 4. ピース選択中なら（緑以外でも）誤タップ防止で抑制
+      if (selectedPlaced) return true;
+      return false;
+    };
+
+    const onTouchStart = (e) => {
+      if (e.touches.length === 0) return;
+      const t = e.touches[0];
+      if (shouldConsumeTouch(t.clientX, t.clientY)) {
+        e.preventDefault();
+      }
+    };
+
+    const onTouchMove = (e) => {
+      // 操作中（pointerDownRef がある）なら常に preventDefault してスクロールを抑制
+      if (pointerDownRef.current) {
+        if (e.cancelable) e.preventDefault();
+      }
+    };
+
+    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    return () => {
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+    };
+  }, [selectedType, selectedPlaced, placed, stage, isRunning]);
+
   const handleRun = () => {
     if (placed.length === 0) return;
     audio.init();
@@ -2731,6 +2872,8 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
         <div className="relative" style={{ width: W, height: H, maxWidth: '100%' }}>
           <canvas
             ref={canvasRef}
+            role="application"
+            aria-label="カラクリ庭ゲームフィールド"
             onMouseDown={(e) => handlePointerDown(e.clientX, e.clientY)}
             onMouseMove={(e) => handlePointerMove(e.clientX, e.clientY)}
             onMouseUp={(e) => handlePointerUp(e.clientX, e.clientY)}
@@ -2774,8 +2917,9 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
             }}
             style={{
               width: '100%', height: 'auto', maxWidth: W,
-              // F11: 縦スクロールを許可（pointerDownRef があるときのみJS側でpreventDefault）
-              touchAction: 'pan-y',
+              // R3-001: touch-action を none に変更し JS 完全制御
+              // 空白エリアでのスクロールはキャンバス外（上下のヘッダー/ツールバー）に委ねる
+              touchAction: 'none',
               cursor: draggingPiece ? 'grabbing' : (selectedType ? 'crosshair' : 'pointer'),
               userSelect: 'none',
             }}
@@ -2921,29 +3065,7 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
 
       {/* F18: 整える確認ダイアログ */}
       {showResetConfirm && (
-        <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(43,42,40,0.5)', zIndex: 35 }}>
-          <div className="fade-in mx-4 p-5 border" style={{ background: PALETTE.sand, borderColor: PALETTE.ink, maxWidth: 300 }}>
-            <div className="font-noto-serif text-sm mb-4 text-center" style={{ color: PALETTE.ink }}>
-              全ての配置を解いて<br />もう一度はじめから組みますか？
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={doReset}
-                className="flex-1 py-2 font-noto-serif text-xs border"
-                style={{ background: PALETTE.vermilion, color: PALETTE.sand, borderColor: PALETTE.vermilion }}
-              >
-                整える
-              </button>
-              <button
-                onClick={() => setShowResetConfirm(false)}
-                className="flex-1 py-2 font-noto-serif text-xs border"
-                style={{ color: PALETTE.ink, borderColor: PALETTE.inkSoft + '60' }}
-              >
-                やめる
-              </button>
-            </div>
-          </div>
-        </div>
+        <ResetConfirmModal onConfirm={doReset} onCancel={() => setShowResetConfirm(false)} />
       )}
 
       {/* 結果モーダル */}
@@ -2952,6 +3074,7 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
           result={result}
           stage={stage}
           hintUsed={hintUsed}
+          saveStatus={saveStatus}
           onRetry={() => {
             setResult(null);
             const bsx = (stage.ballStart.col + 0.5) * CELL;
@@ -2972,6 +3095,50 @@ function PlayScreen({ stage, progress, hintUsed: initialHintUsed, onComplete, on
           onSelect={onBack}
         />
       )}
+    </div>
+  );
+}
+
+// R3-009: 整える確認モーダル（role=dialog + フォーカストラップ）
+function ResetConfirmModal({ onConfirm, onCancel }) {
+  const ref = useRef(null);
+  useFocusTrap(ref, true);
+  return (
+    <div
+      className="absolute inset-0 flex items-center justify-center"
+      style={{ background: 'rgba(43,42,40,0.5)', zIndex: 35 }}
+      onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}
+    >
+      <div
+        ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="reset-confirm-title"
+        className="fade-in mx-4 p-5 border"
+        style={{ background: PALETTE.sand, borderColor: PALETTE.ink, maxWidth: 300 }}
+      >
+        <div id="reset-confirm-title" className="font-noto-serif text-sm mb-4 text-center" style={{ color: PALETTE.ink }}>
+          全ての配置を解いて<br />もう一度はじめから組みますか？
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={onConfirm}
+            aria-label="整える（リセットする）"
+            className="flex-1 py-2 font-noto-serif text-xs border"
+            style={{ background: PALETTE.vermilion, color: PALETTE.sand, borderColor: PALETTE.vermilion }}
+          >
+            整える
+          </button>
+          <button
+            onClick={onCancel}
+            aria-label="やめる"
+            className="flex-1 py-2 font-noto-serif text-xs border"
+            style={{ color: PALETTE.ink, borderColor: PALETTE.inkSoft + '60' }}
+          >
+            やめる
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3004,7 +3171,10 @@ function PiecePreview({ type, size = 32 }) {
 }
 
 // 結果モーダル
-function ResultModal({ result, stage, hintUsed, onRetry, onChange, onNext, onSelect }) {
+function ResultModal({ result, stage, hintUsed, saveStatus, onRetry, onChange, onNext, onSelect }) {
+  const dialogRef = useRef(null);
+  useFocusTrap(dialogRef, true);
+
   if (result.failed) {
     // F3: 失敗種別ごとのメッセージ
     const failureMessages = {
@@ -3015,14 +3185,22 @@ function ResultModal({ result, stage, hintUsed, onRetry, onChange, onNext, onSel
     const msg = failureMessages[result.reason] || { title: '玉が、届かなかった', sub: '仕掛けを直して、もう一度' };
     return (
       <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(43,42,40,0.5)', zIndex: 30 }}>
-        <div className="fade-in mx-4 p-6 border" style={{ background: PALETTE.sand, borderColor: PALETTE.ink, maxWidth: 320 }}>
+        <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="result-fail-title"
+          className="fade-in mx-4 p-6 border"
+          style={{ background: PALETTE.sand, borderColor: PALETTE.ink, maxWidth: 320 }}
+        >
           <div className="text-center">
             <div className="font-noto-serif text-xs tracking-widest mb-3" style={{ color: PALETTE.inkSoft }}>失敗</div>
-            <div className="font-noto-serif text-lg mb-1" style={{ color: PALETTE.ink }}>{msg.title}</div>
+            <div id="result-fail-title" className="font-noto-serif text-lg mb-1" style={{ color: PALETTE.ink }}>{msg.title}</div>
             <div className="font-noto-serif text-sm mb-6" style={{ color: PALETTE.inkSoft }}>{msg.sub}</div>
             <div className="flex gap-2">
               <button
                 onClick={onRetry}
+                aria-label="もう一度挑戦する"
                 className="flex-1 py-2 font-noto-serif text-sm border"
                 style={{ background: PALETTE.ink, color: PALETTE.sand, borderColor: PALETTE.ink }}
               >
@@ -3030,6 +3208,7 @@ function ResultModal({ result, stage, hintUsed, onRetry, onChange, onNext, onSel
               </button>
               <button
                 onClick={onChange}
+                aria-label="配置を変える"
                 className="flex-1 py-2 font-noto-serif text-sm border"
                 style={{ color: PALETTE.ink, borderColor: PALETTE.inkSoft + '60' }}
               >
@@ -3048,9 +3227,16 @@ function ResultModal({ result, stage, hintUsed, onRetry, onChange, onNext, onSel
 
   return (
     <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(43,42,40,0.5)', zIndex: 30 }}>
-      <div className="fade-in mx-4 p-6 border" style={{ background: PALETTE.sand, borderColor: PALETTE.ink, maxWidth: 320 }}>
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="result-clear-title"
+        className="fade-in mx-4 p-6 border"
+        style={{ background: PALETTE.sand, borderColor: PALETTE.ink, maxWidth: 320 }}
+      >
         <div className="text-center">
-          <div className="font-noto-serif text-xs tracking-widest mb-3" style={{ color: PALETTE.inkSoft }}>
+          <div id="result-clear-title" className="font-noto-serif text-xs tracking-widest mb-3" style={{ color: PALETTE.inkSoft }}>
             清まりました
           </div>
           <div className="mb-4">
@@ -3115,6 +3301,22 @@ function ResultModal({ result, stage, hintUsed, onRetry, onChange, onNext, onSel
               庭を選び直す
             </button>
           </div>
+          {/* R3-007: 保存状態の小さなステータス表示 */}
+          {saveStatus && saveStatus !== 'idle' && (
+            <div
+              className="font-noto-serif text-[10px] mt-3"
+              style={{
+                color: saveStatus === 'failed' ? PALETTE.vermilion : PALETTE.inkSoft,
+                opacity: 0.85,
+              }}
+              role="status"
+              aria-live="polite"
+            >
+              {saveStatus === 'saving' && '保存中…'}
+              {saveStatus === 'saved' && '保存完了 ✓'}
+              {saveStatus === 'failed' && '保存できませんでした'}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -3124,10 +3326,23 @@ function ResultModal({ result, stage, hintUsed, onRetry, onChange, onNext, onSel
 // メニューモーダル
 function MenuModal({ onClose, onClearProgress, onAbout }) {
   const [confirmClear, setConfirmClear] = useState(false);
+  const dialogRef = useRef(null);
+  useFocusTrap(dialogRef, true);
   return (
-    <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(43,42,40,0.5)', zIndex: 40 }}>
-      <div className="fade-in mx-4 p-6 border w-full max-w-xs" style={{ background: PALETTE.sand, borderColor: PALETTE.ink }}>
-        <div className="font-noto-serif text-base tracking-widest mb-4 text-center" style={{ color: PALETTE.ink }}>
+    <div
+      className="absolute inset-0 flex items-center justify-center"
+      style={{ background: 'rgba(43,42,40,0.5)', zIndex: 40 }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="menu-modal-title"
+        className="fade-in mx-4 p-6 border w-full max-w-xs"
+        style={{ background: PALETTE.sand, borderColor: PALETTE.ink }}
+      >
+        <div id="menu-modal-title" className="font-noto-serif text-base tracking-widest mb-4 text-center" style={{ color: PALETTE.ink }}>
           設定
         </div>
         <div className="flex flex-col gap-2">
@@ -3184,10 +3399,23 @@ function MenuModal({ onClose, onClearProgress, onAbout }) {
 
 // Aboutモーダル
 function AboutModal({ onClose }) {
+  const dialogRef = useRef(null);
+  useFocusTrap(dialogRef, true);
   return (
-    <div className="absolute inset-0 flex items-center justify-center" style={{ background: 'rgba(43,42,40,0.5)', zIndex: 50 }}>
-      <div className="fade-in mx-4 p-6 border w-full max-w-sm max-h-[80vh] overflow-y-auto scrollbar-thin" style={{ background: PALETTE.sand, borderColor: PALETTE.ink }}>
-        <div className="font-noto-serif text-base tracking-widest mb-4 text-center" style={{ color: PALETTE.ink }}>
+    <div
+      className="absolute inset-0 flex items-center justify-center"
+      style={{ background: 'rgba(43,42,40,0.5)', zIndex: 50 }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="about-modal-title"
+        className="fade-in mx-4 p-6 border w-full max-w-sm max-h-[80vh] overflow-y-auto scrollbar-thin"
+        style={{ background: PALETTE.sand, borderColor: PALETTE.ink }}
+      >
+        <div id="about-modal-title" className="font-noto-serif text-base tracking-widest mb-4 text-center" style={{ color: PALETTE.ink }}>
           機巧庭について
         </div>
         <div className="space-y-3 font-noto-serif text-sm leading-relaxed" style={{ color: PALETTE.ink }}>

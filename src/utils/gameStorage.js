@@ -9,6 +9,9 @@
  *
  * ログイン済み: Firestore /user_progress/{uid} に保存
  * 未ログイン:   localStorage にフォールバック
+ *
+ * R3-003: set / delete 失敗時は例外を再スロー（呼び出し元でUI通知）
+ *         get 失敗時は null を返しつつ console.warn
  */
 import { auth, db } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
@@ -33,47 +36,67 @@ async function saveDoc(data) {
 
 export const gameStorage = {
   async get(key) {
-    const uid = auth.currentUser?.uid;
-    if (!uid) {
-      const raw = localStorage.getItem(LOCAL_PREFIX + key);
-      return raw !== null ? { value: raw } : null;
+    try {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        const raw = localStorage.getItem(LOCAL_PREFIX + key);
+        return raw !== null ? { value: raw } : null;
+      }
+      const data = await loadDoc();
+      const val = data?.[key];
+      return val !== undefined ? { value: val } : null;
+    } catch (err) {
+      console.warn('[gameStorage] get failed:', err);
+      return null;
     }
-    const data = await loadDoc();
-    const val = data?.[key];
-    return val !== undefined ? { value: val } : null;
   },
 
   async set(key, value) {
-    const uid = auth.currentUser?.uid;
-    if (!uid) {
-      localStorage.setItem(LOCAL_PREFIX + key, value);
-      return;
+    try {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        localStorage.setItem(LOCAL_PREFIX + key, value);
+        return;
+      }
+      const data = (await loadDoc()) || {};
+      data[key] = value;
+      await saveDoc(data);
+    } catch (err) {
+      console.warn('[gameStorage] set failed:', err);
+      throw err;
     }
-    const data = (await loadDoc()) || {};
-    data[key] = value;
-    await saveDoc(data);
   },
 
   async delete(key) {
-    const uid = auth.currentUser?.uid;
-    if (!uid) {
-      localStorage.removeItem(LOCAL_PREFIX + key);
-      return;
+    try {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        localStorage.removeItem(LOCAL_PREFIX + key);
+        return;
+      }
+      const data = (await loadDoc()) || {};
+      delete data[key];
+      await saveDoc(data);
+    } catch (err) {
+      console.warn('[gameStorage] delete failed:', err);
+      throw err;
     }
-    const data = (await loadDoc()) || {};
-    delete data[key];
-    await saveDoc(data);
   },
 
   async list() {
-    const uid = auth.currentUser?.uid;
-    if (!uid) {
-      return Object.keys(localStorage)
-        .filter(k => k.startsWith(LOCAL_PREFIX))
-        .map(k => k.slice(LOCAL_PREFIX.length));
+    try {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        return Object.keys(localStorage)
+          .filter(k => k.startsWith(LOCAL_PREFIX))
+          .map(k => k.slice(LOCAL_PREFIX.length));
+      }
+      const data = (await loadDoc()) || {};
+      return Object.keys(data);
+    } catch (err) {
+      console.warn('[gameStorage] list failed:', err);
+      return [];
     }
-    const data = (await loadDoc()) || {};
-    return Object.keys(data);
   },
 };
 
